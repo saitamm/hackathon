@@ -41,3 +41,66 @@ export async function transcribeAudio(audioBlob, lang = 'en') {
     const data = await res.json()
     return data.text || ''
 }
+
+/**
+ * Speak text using ElevenLabs streaming TTS via the backend.
+ * Uses MediaSource Extensions for true streaming — audio begins
+ * playing as soon as the first chunk arrives, no waiting for the
+ * full download, so the voice sounds seamless and uninterrupted.
+ *
+ * Calling again while playing cancels the previous audio.
+ * @param {string} text
+ * @returns {Promise<void>} resolves when playback finishes
+ */
+let _currentAudio = null
+let _cancelId = 0
+
+export async function speakText(text) {
+    // Cancel any currently playing audio
+    const id = ++_cancelId
+    if (_currentAudio) {
+        _currentAudio.pause()
+        _currentAudio.src = ''
+        _currentAudio = null
+    }
+
+    const res = await fetch(`${BASE}/api/tts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+    })
+    if (!res.ok || id !== _cancelId) return
+
+    // Collect all audio data then play (most reliable cross-browser)
+    const reader = res.body.getReader()
+    const chunks = []
+    while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (id !== _cancelId) return // cancelled
+        chunks.push(value)
+    }
+
+    if (id !== _cancelId) return
+
+    const blob = new Blob(chunks, { type: 'audio/mpeg' })
+    const url = URL.createObjectURL(blob)
+    const audio = new Audio(url)
+    // Prevent gaps: disable media session interruptions
+    audio.preload = 'auto'
+    _currentAudio = audio
+
+    return new Promise((resolve) => {
+        audio.onended = () => {
+            URL.revokeObjectURL(url)
+            if (_currentAudio === audio) _currentAudio = null
+            resolve()
+        }
+        audio.onerror = () => {
+            URL.revokeObjectURL(url)
+            if (_currentAudio === audio) _currentAudio = null
+            resolve()
+        }
+        audio.play().catch(() => resolve())
+    })
+}
