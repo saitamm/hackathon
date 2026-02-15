@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { transcribeAudio } from '../lib/api'
+import { transcribeAudio, speakText } from '../lib/api'
 
 const STEPS = [
     { key: 'fullName', label: 'Full Name', prompt: 'What is the patient\'s full name?', type: 'text', placeholder: 'e.g. Sarah Chen' },
@@ -20,6 +20,7 @@ const WELCOME_MESSAGE = 'Hello, welcome! Can you fill the requirements so we kno
 
 export default function VoiceCapture({ onPatientData, onTranscript, onComplete }) {
     const [showWelcome, setShowWelcome] = useState(true)
+    const [conversationMode, setConversationMode] = useState(false)
     const [step, setStep] = useState(0)
     const [data, setData] = useState({
         fullName: '', age: '', sex: '',
@@ -35,26 +36,36 @@ export default function VoiceCapture({ onPatientData, onTranscript, onComplete }
     const mediaRecorderRef = useRef(null)
     const audioChunksRef = useRef([])
     const stepRef = useRef(0)
-    const applyVoiceResultRef = useRef(() => {})
-    const advanceStepRef = useRef(() => {})
+    const applyVoiceResultRef = useRef(() => { })
+    const advanceStepRef = useRef(() => { })
     const welcomeSpokenRef = useRef(false)
+
+    // Conversation mode state
+    const [convoPhase, setConvoPhase] = useState('idle') // idle | speaking | listening | transcribing | done
+    const [convoLog, setConvoLog] = useState([]) // { role: 'ai'|'user', text: string }[]
+    const convoActiveRef = useRef(false)
+    const dataRef = useRef(data)
+    dataRef.current = data
 
     stepRef.current = step
 
-    // Speak welcome message once when welcome screen is shown (browser only)
+    // Speak welcome message once when welcome screen is shown
     useEffect(() => {
         if (!showWelcome || typeof window === 'undefined') return
         if (welcomeSpokenRef.current) return
         welcomeSpokenRef.current = true
-        const speak = () => {
-            const u = new SpeechSynthesisUtterance(WELCOME_MESSAGE)
-            u.rate = 0.95
-            u.pitch = 1
-            if (window.speechSynthesis) window.speechSynthesis.speak(u)
-        }
-        const t = setTimeout(speak, 600)
+        const t = setTimeout(() => speakText(WELCOME_MESSAGE).catch(() => { }), 600)
         return () => clearTimeout(t)
     }, [showWelcome])
+
+    // Speak each step's prompt when advancing through the wizard (only in form mode)
+    const lastSpokenStepRef = useRef(-1)
+    useEffect(() => {
+        if (showWelcome || conversationMode) return
+        if (lastSpokenStepRef.current === step) return
+        lastSpokenStepRef.current = step
+        speakText(STEPS[step].prompt).catch(() => { })
+    }, [step, showWelcome, conversationMode])
 
     const NUMBER_WORDS = { zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 }
 
@@ -92,7 +103,43 @@ export default function VoiceCapture({ onPatientData, onTranscript, onComplete }
         setVoiceSupported(!!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia))
     }, [])
 
-    // Start recording from the microphone
+    // ── Recording helpers (shared by form mode and conversation mode) ──
+    function recordAudio() {
+        return new Promise(async (resolve, reject) => {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+                const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+                    ? 'audio/webm;codecs=opus'
+                    : 'audio/webm'
+                const recorder = new MediaRecorder(stream, { mimeType })
+                const chunks = []
+                recorder.ondataavailable = (e) => {
+                    if (e.data.size > 0) chunks.push(e.data)
+                }
+                recorder.onstop = () => {
+                    stream.getTracks().forEach(t => t.stop())
+                    const blob = new Blob(chunks, { type: mimeType })
+                    resolve(blob)
+                }
+                recorder.start()
+                // Store so we can stop externally
+                mediaRecorderRef.current = recorder
+                setIsListening(true)
+            } catch (err) {
+                reject(err)
+            }
+        })
+    }
+
+    function stopRecording() {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+            mediaRecorderRef.current.stop()
+            mediaRecorderRef.current = null
+            setIsListening(false)
+        }
+    }
+
+    // Start recording from the microphone (form mode – legacy)
     const startListening = useCallback(async () => {
         if (isListening || isTranscribing) return
         try {
@@ -106,10 +153,9 @@ export default function VoiceCapture({ onPatientData, onTranscript, onComplete }
                 if (e.data.size > 0) audioChunksRef.current.push(e.data)
             }
             recorder.onstop = async () => {
-                // Stop all mic tracks
                 stream.getTracks().forEach(t => t.stop())
                 const blob = new Blob(audioChunksRef.current, { type: mimeType })
-                if (blob.size < 100) return // too short, ignore
+                if (blob.size < 100) return
 
                 setIsTranscribing(true)
                 try {
@@ -127,7 +173,7 @@ export default function VoiceCapture({ onPatientData, onTranscript, onComplete }
                         }
                     }
                 } catch (err) {
-                    console.error('ElevenLabs STT error:', err)
+                    console.error('STT error:', err)
                 } finally {
                     setIsTranscribing(false)
                 }
@@ -140,7 +186,6 @@ export default function VoiceCapture({ onPatientData, onTranscript, onComplete }
         }
     }, [isListening, isTranscribing])
 
-    // Stop recording — triggers onstop which sends to ElevenLabs
     const stopListening = useCallback(() => {
         if (!mediaRecorderRef.current || !isListening) return
         mediaRecorderRef.current.stop()
@@ -148,10 +193,11 @@ export default function VoiceCapture({ onPatientData, onTranscript, onComplete }
         setIsListening(false)
     }, [isListening])
 
-    // Auto-focus input on step change (when not in voice-only mode)
+    // Auto-focus input on step change (form mode)
     useEffect(() => {
+        if (conversationMode) return
         if (!voiceSupported) setTimeout(() => inputRef.current?.focus(), 300)
-    }, [step, voiceSupported])
+    }, [step, voiceSupported, conversationMode])
 
     const current = STEPS[step]
     const totalSteps = STEPS.length
@@ -230,6 +276,136 @@ export default function VoiceCapture({ onPatientData, onTranscript, onComplete }
             e.preventDefault()
             goNext()
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // ██  CONVERSATION MODE — fully voice-driven triage loop       ██
+    // ════════════════════════════════════════════════════════════════
+    async function startConversation() {
+        setShowWelcome(false)
+        setConversationMode(true)
+        setConvoLog([])
+        setStep(0)
+        convoActiveRef.current = true
+        // Small delay then start the loop
+        setTimeout(() => runConversationLoop(0, {}), 400)
+    }
+
+    async function runConversationLoop(stepIdx, accumulated) {
+        if (!convoActiveRef.current) return
+        if (stepIdx >= STEPS.length) {
+            // All done — submit
+            setConvoPhase('done')
+            const finalData = { ...dataRef.current, ...accumulated }
+            const builtSymptoms = buildSymptomsString(finalData)
+            setConvoLog(prev => [...prev, { role: 'ai', text: 'Thank you! I have all the information. Analyzing your data now…' }])
+            await speakText('Thank you! I have all the information. Analyzing your data now.').catch(() => { })
+            onTranscript(builtSymptoms)
+            onComplete?.({ symptoms: builtSymptoms, patientData: finalData })
+            convoActiveRef.current = false
+            return
+        }
+
+        const stepConfig = STEPS[stepIdx]
+        setStep(stepIdx)
+
+        // 1. AI speaks the question
+        setConvoPhase('speaking')
+        setConvoLog(prev => [...prev, { role: 'ai', text: stepConfig.prompt }])
+        await speakText(stepConfig.prompt).catch(() => { })
+        if (!convoActiveRef.current) return
+
+        // 2. Auto-start recording
+        setConvoPhase('listening')
+        let blob
+        try {
+            const recordPromise = recordAudio()
+            // Wait for user to tap stop — we don't auto-stop, user controls it
+            blob = await recordPromise
+        } catch (err) {
+            console.error('Recording error:', err)
+            convoActiveRef.current = false
+            return
+        }
+        if (!convoActiveRef.current) return
+        if (!blob || blob.size < 100) {
+            // Re-ask if recording was too short
+            await speakText("I didn't hear anything. Let me ask again.").catch(() => { })
+            runConversationLoop(stepIdx, accumulated)
+            return
+        }
+
+        // 3. Transcribe
+        setConvoPhase('transcribing')
+        setIsTranscribing(true)
+        let text
+        try {
+            text = await transcribeAudio(blob)
+        } catch (err) {
+            console.error('Transcription error:', err)
+            setIsTranscribing(false)
+            await speakText("Sorry, I couldn't understand that. Let me ask again.").catch(() => { })
+            runConversationLoop(stepIdx, accumulated)
+            return
+        }
+        setIsTranscribing(false)
+        if (!convoActiveRef.current) return
+
+        // 4. Normalize and validate
+        const normalized = normalizeVoiceValue(text, stepConfig)
+        setConvoLog(prev => [...prev, { role: 'user', text: text || '(no speech detected)' }])
+
+        if (normalized === undefined) {
+            // Invalid answer — re-ask with a hint
+            const hint = stepConfig.type === 'yesno'
+                ? 'Please answer with yes or no.'
+                : stepConfig.type === 'select'
+                    ? 'Please say male, female, or other.'
+                    : stepConfig.type === 'number'
+                        ? 'Please say a number.'
+                        : 'Could you repeat that?'
+            setConvoLog(prev => [...prev, { role: 'ai', text: `I didn't catch that. ${hint}` }])
+            await speakText(`I didn't catch that. ${hint}`).catch(() => { })
+            runConversationLoop(stepIdx, accumulated)
+            return
+        }
+
+        // 5. Apply value
+        const newAccumulated = { ...accumulated, [stepConfig.key]: normalized }
+        const updated = { ...dataRef.current, [stepConfig.key]: normalized }
+        setData(updated)
+        onPatientData(updated)
+
+        // Check emergency
+        if (stepConfig.type === 'yesno') {
+            const triggersEmergency = (stepConfig.noIsEmergency && normalized === 'no') || (stepConfig.yesIsEmergency && normalized === 'yes')
+            if (triggersEmergency) {
+                setConvoPhase('done')
+                convoActiveRef.current = false
+                onComplete?.({ emergency: true, emergencyReason: stepConfig.emergencyReason, data: updated })
+                return
+            }
+        }
+
+        // 6. Confirm and advance
+        const confirmMsg = stepConfig.type === 'yesno'
+            ? `Got it, ${normalized}.`
+            : `Got it, ${normalized}.`
+        setConvoLog(prev => [...prev, { role: 'ai', text: confirmMsg }])
+        await speakText(confirmMsg).catch(() => { })
+
+        // Move to next step
+        runConversationLoop(stepIdx + 1, newAccumulated)
+    }
+
+    // Stop conversation mode
+    function cancelConversation() {
+        convoActiveRef.current = false
+        stopRecording()
+        setConversationMode(false)
+        setConvoPhase('idle')
+        setShowWelcome(true)
+        setStep(0)
     }
 
     // ── Render yes/no step with emergency labels ──
@@ -330,102 +506,75 @@ export default function VoiceCapture({ onPatientData, onTranscript, onComplete }
         )
     }
 
-    // ── Render field based on step type (voice-only when supported, else fallback inputs) ──
+    // ── Render field based on step type — always show BOTH voice + text/buttons ──
     function renderInput() {
         if (current.type === 'select') {
-            if (voiceSupported) {
-                return (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-                        {renderVoiceControl('Say: Male, Female, or Other')}
-                        {data[current.key] && (
-                            <div style={{
-                                fontSize: '1rem',
-                                padding: '0.75rem',
-                                textAlign: 'center',
-                                color: 'var(--cyan)',
-                                textTransform: 'capitalize',
-                            }}>
-                                ✓ {data[current.key]}
-                            </div>
-                        )}
-                    </div>
-                )
-            }
             return (
-                <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', justifyContent: 'center' }}>
-                    {current.options.map(opt => (
-                        <button
-                            key={opt}
-                            className={`btn ${data[current.key] === opt ? 'btn-primary' : ''}`}
-                            onClick={() => handleChange(opt)}
-                            style={{
-                                padding: '0.85rem 1.5rem',
-                                fontSize: '0.95rem',
-                                textTransform: 'capitalize',
-                                transition: 'all 0.2s ease',
-                            }}
-                        >
-                            {opt === 'male' ? '👨 Male' : opt === 'female' ? '👩 Female' : '⚧ Other'}
-                        </button>
-                    ))}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                    {voiceSupported && renderVoiceControl('Say: Male, Female, or Other')}
+                    <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', justifyContent: 'center' }}>
+                        {current.options.map(opt => (
+                            <button
+                                key={opt}
+                                className={`btn ${data[current.key] === opt ? 'btn-primary' : ''}`}
+                                onClick={() => handleChange(opt)}
+                                style={{
+                                    padding: '0.85rem 1.5rem',
+                                    fontSize: '0.95rem',
+                                    textTransform: 'capitalize',
+                                    transition: 'all 0.2s ease',
+                                }}
+                            >
+                                {opt === 'male' ? '👨 Male' : opt === 'female' ? '👩 Female' : '⚧ Other'}
+                            </button>
+                        ))}
+                    </div>
                 </div>
             )
         }
 
         if (current.type === 'yesno') {
-            if (voiceSupported) {
-                return (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-                        {renderVoiceControl('Say: Yes or No')}
-                        {(data[current.key] === 'yes' || data[current.key] === 'no') && (
-                            <div style={{
-                                fontSize: '1rem',
-                                padding: '0.75rem',
-                                textAlign: 'center',
-                                color: data[current.key] === 'yes' ? 'var(--routine)' : 'var(--critical)',
-                            }}>
-                                ✓ {data[current.key] === 'yes' ? 'Yes' : 'No'}
-                            </div>
-                        )}
-                    </div>
-                )
-            }
-            return renderYesNo()
-        }
-
-        // Text and number: voice-only when supported, else text input
-        if (voiceSupported) {
             return (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-                    {renderVoiceControl(current.placeholder ? `e.g. ${current.placeholder}` : 'Tap mic to speak')}
-                    {getCurrentValue() && (
-                        <div style={{
-                            fontSize: '1.1rem',
-                            padding: '0.75rem 1rem',
-                            textAlign: 'center',
-                            background: 'rgba(0,212,255,0.06)',
-                            border: '1px solid rgba(0,212,255,0.2)',
-                            borderRadius: 'var(--radius-md)',
-                            color: 'var(--text)',
-                            minHeight: '2.5rem',
-                        }}>
-                            {getCurrentValue()}
-                        </div>
-                    )}
-                    {current.subPrompt && (
-                        <div style={{ fontSize: '0.75rem', color: 'var(--muted)', textAlign: 'center' }}>
-                            {current.subPrompt}
-                        </div>
-                    )}
+                    {voiceSupported && renderVoiceControl('Say: Yes or No')}
+                    {renderYesNo()}
                 </div>
             )
         }
+
         return (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                {voiceSupported && renderVoiceControl(current.placeholder ? `e.g. ${current.placeholder}` : 'Tap mic to speak')}
+                {voiceSupported && getCurrentValue() && (
+                    <div style={{
+                        fontSize: '1.1rem',
+                        padding: '0.75rem 1rem',
+                        textAlign: 'center',
+                        background: 'rgba(0,212,255,0.06)',
+                        border: '1px solid rgba(0,212,255,0.2)',
+                        borderRadius: 'var(--radius-md)',
+                        color: 'var(--text)',
+                        minHeight: '2.5rem',
+                    }}>
+                        {getCurrentValue()}
+                    </div>
+                )}
+                {voiceSupported && (
+                    <div style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.75rem',
+                        margin: '0.25rem 0',
+                    }}>
+                        <div style={{ flex: 1, height: '1px', background: 'rgba(255,255,255,0.08)' }} />
+                        <span style={{ fontSize: '0.65rem', color: 'var(--muted)', letterSpacing: '0.1em' }}>OR TYPE</span>
+                        <div style={{ flex: 1, height: '1px', background: 'rgba(255,255,255,0.08)' }} />
+                    </div>
+                )}
                 <input
                     ref={inputRef}
                     className="input"
-                    type={current.type}
+                    type={current.type === 'number' ? 'number' : 'text'}
                     value={getCurrentValue() || ''}
                     onChange={(e) => handleChange(e.target.value)}
                     onKeyDown={handleKeyDown}
@@ -437,7 +586,7 @@ export default function VoiceCapture({ onPatientData, onTranscript, onComplete }
                         padding: '1rem 1.25rem',
                         textAlign: 'center',
                     }}
-                    autoFocus
+                    autoFocus={!voiceSupported}
                 />
                 {current.subPrompt && (
                     <div style={{ fontSize: '0.75rem', color: 'var(--muted)', textAlign: 'center' }}>
@@ -448,7 +597,224 @@ export default function VoiceCapture({ onPatientData, onTranscript, onComplete }
         )
     }
 
-    // Welcome screen (first thing the user sees)
+    // ════════════════════════════════════════════════════════════════
+    // ██  CONVERSATION MODE UI                                     ██
+    // ════════════════════════════════════════════════════════════════
+    if (conversationMode) {
+        const phaseLabel = {
+            idle: 'Starting conversation…',
+            speaking: '🔊 AI is speaking…',
+            listening: '🎤 Your turn — tap to stop when done',
+            transcribing: '⏳ Processing your answer…',
+            done: '✅ All done!',
+        }[convoPhase] || ''
+
+        return (
+            <div className="panel" style={{ animation: 'fadeUp 0.6s cubic-bezier(0.22,1,0.36,1) forwards' }}>
+                {/* Header */}
+                <div style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    marginBottom: '1.25rem',
+                }}>
+                    <div style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.5rem',
+                    }}>
+                        <div style={{
+                            width: '8px',
+                            height: '8px',
+                            borderRadius: '50%',
+                            background: convoPhase === 'done' ? 'var(--routine)' : 'var(--cyan)',
+                            boxShadow: `0 0 8px ${convoPhase === 'done' ? 'var(--routine-glow)' : 'var(--cyan-glow)'}`,
+                            animation: convoPhase !== 'done' ? 'pulse 1.5s ease infinite' : undefined,
+                        }} />
+                        <span style={{
+                            fontSize: '0.7rem',
+                            fontFamily: 'var(--font-head)',
+                            color: 'var(--cyan)',
+                            letterSpacing: '0.1em',
+                        }}>
+                            CONVERSATION MODE
+                        </span>
+                    </div>
+                    <button
+                        className="btn"
+                        onClick={cancelConversation}
+                        style={{
+                            padding: '0.3rem 0.7rem',
+                            fontSize: '0.65rem',
+                        }}
+                    >
+                        ✕ EXIT
+                    </button>
+                </div>
+
+                {/* Progress bar */}
+                <div style={{
+                    display: 'flex',
+                    gap: '4px',
+                    marginBottom: '1.25rem',
+                }}>
+                    {STEPS.map((s, i) => (
+                        <div
+                            key={s.key}
+                            style={{
+                                flex: 1,
+                                height: '3px',
+                                borderRadius: '2px',
+                                background: i <= step
+                                    ? 'linear-gradient(90deg, var(--cyan), var(--purple))'
+                                    : 'rgba(255,255,255,0.06)',
+                                transition: 'all 0.4s ease',
+                                boxShadow: i <= step ? '0 0 6px var(--cyan-glow)' : 'none',
+                            }}
+                        />
+                    ))}
+                </div>
+
+                {/* Chat log */}
+                <div style={{
+                    maxHeight: '280px',
+                    overflowY: 'auto',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.6rem',
+                    marginBottom: '1.25rem',
+                    padding: '0.5rem 0',
+                }}>
+                    {convoLog.map((msg, i) => (
+                        <div
+                            key={i}
+                            style={{
+                                display: 'flex',
+                                justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start',
+                                animation: 'fadeUp 0.3s ease',
+                            }}
+                        >
+                            <div style={{
+                                maxWidth: '85%',
+                                padding: '0.6rem 0.9rem',
+                                borderRadius: msg.role === 'user'
+                                    ? '12px 12px 4px 12px'
+                                    : '12px 12px 12px 4px',
+                                background: msg.role === 'user'
+                                    ? 'rgba(168, 85, 247, 0.15)'
+                                    : 'rgba(0, 212, 255, 0.08)',
+                                border: `1px solid ${msg.role === 'user'
+                                    ? 'rgba(168, 85, 247, 0.25)'
+                                    : 'rgba(0, 212, 255, 0.15)'}`,
+                                fontSize: '0.85rem',
+                                color: 'var(--text)',
+                                lineHeight: 1.4,
+                            }}>
+                                <span style={{
+                                    fontSize: '0.6rem',
+                                    color: msg.role === 'user' ? 'var(--purple)' : 'var(--cyan)',
+                                    letterSpacing: '0.1em',
+                                    display: 'block',
+                                    marginBottom: '0.2rem',
+                                    fontWeight: 600,
+                                }}>
+                                    {msg.role === 'user' ? 'YOU' : 'AI NURSE'}
+                                </span>
+                                {msg.text}
+                            </div>
+                        </div>
+                    ))}
+                </div>
+
+                {/* Central mic button (for stopping recording) */}
+                <div style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    gap: '0.75rem',
+                    padding: '0.5rem 0',
+                }}>
+                    {convoPhase === 'listening' && (
+                        <button
+                            type="button"
+                            onClick={stopRecording}
+                            className="btn btn-critical"
+                            style={{
+                                width: '88px',
+                                height: '88px',
+                                borderRadius: '50%',
+                                padding: 0,
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                fontSize: '2.5rem',
+                                boxShadow: '0 0 30px rgba(239,68,68,0.5)',
+                                animation: 'pulse 1.2s ease infinite',
+                            }}
+                            aria-label="Stop recording"
+                        >
+                            🎤
+                        </button>
+                    )}
+                    {convoPhase === 'speaking' && (
+                        <div style={{
+                            width: '88px',
+                            height: '88px',
+                            borderRadius: '50%',
+                            background: 'linear-gradient(135deg, rgba(0,212,255,0.15), rgba(168,85,247,0.15))',
+                            border: '2px solid rgba(0,212,255,0.3)',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            fontSize: '2.5rem',
+                            animation: 'pulse 1.5s ease infinite',
+                            boxShadow: '0 0 24px var(--cyan-glow)',
+                        }}>
+                            🔊
+                        </div>
+                    )}
+                    {convoPhase === 'transcribing' && (
+                        <div style={{
+                            width: '88px',
+                            height: '88px',
+                            borderRadius: '50%',
+                            background: 'rgba(168,85,247,0.1)',
+                            border: '2px solid rgba(168,85,247,0.3)',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            fontSize: '2.5rem',
+                            animation: 'pulse 1.2s ease infinite',
+                            boxShadow: '0 0 24px rgba(168,85,247,0.3)',
+                        }}>
+                            ⏳
+                        </div>
+                    )}
+
+                    {/* Phase label */}
+                    <div style={{
+                        fontSize: '0.8rem',
+                        color: convoPhase === 'listening'
+                            ? 'var(--critical)'
+                            : convoPhase === 'speaking'
+                                ? 'var(--cyan)'
+                                : convoPhase === 'transcribing'
+                                    ? 'var(--purple)'
+                                    : 'var(--routine)',
+                        letterSpacing: '0.06em',
+                        fontWeight: 500,
+                        textAlign: 'center',
+                    }}>
+                        {phaseLabel}
+                    </div>
+                </div>
+            </div>
+        )
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // ██  WELCOME SCREEN                                           ██
+    // ════════════════════════════════════════════════════════════════
     if (showWelcome) {
         return (
             <div className="panel" style={{ animation: 'fadeUp 0.6s cubic-bezier(0.22,1,0.36,1) forwards' }}>
@@ -483,36 +849,72 @@ export default function VoiceCapture({ onPatientData, onTranscript, onComplete }
                     }}>
                         {WELCOME_MESSAGE}
                     </h2>
-                    <button
-                        className="btn btn-primary"
-                        onClick={() => setShowWelcome(false)}
-                        style={{
-                            padding: '0.9rem 2rem',
-                            fontSize: '1rem',
-                            letterSpacing: '0.08em',
-                            marginTop: '0.5rem',
-                        }}
-                    >
-                        Continue →
-                    </button>
+
+                    {/* Two mode buttons */}
+                    <div style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '0.75rem',
+                        width: '100%',
+                        maxWidth: '320px',
+                        marginTop: '0.5rem',
+                    }}>
+                        <button
+                            className="btn btn-primary"
+                            onClick={() => setShowWelcome(false)}
+                            style={{
+                                padding: '0.9rem 2rem',
+                                fontSize: '1rem',
+                                letterSpacing: '0.08em',
+                                width: '100%',
+                            }}
+                        >
+                            📝 Fill Form
+                        </button>
+
+                        <button
+                            className="btn"
+                            onClick={startConversation}
+                            disabled={!voiceSupported}
+                            style={{
+                                padding: '0.9rem 2rem',
+                                fontSize: '1rem',
+                                letterSpacing: '0.08em',
+                                width: '100%',
+                                background: voiceSupported
+                                    ? 'linear-gradient(135deg, rgba(168,85,247,0.15), rgba(0,212,255,0.15))'
+                                    : undefined,
+                                border: voiceSupported
+                                    ? '1px solid rgba(168,85,247,0.35)'
+                                    : undefined,
+                                boxShadow: voiceSupported
+                                    ? '0 0 20px rgba(168,85,247,0.15)'
+                                    : undefined,
+                            }}
+                        >
+                            🎤 Talk to AI
+                        </button>
+
+                        {!voiceSupported && (
+                            <div style={{
+                                fontSize: '0.65rem',
+                                color: 'var(--muted)',
+                                letterSpacing: '0.06em',
+                            }}>
+                                Voice mode requires microphone access
+                            </div>
+                        )}
+                    </div>
                 </div>
             </div>
         )
     }
 
+    // ════════════════════════════════════════════════════════════════
+    // ██  FORM MODE (original step-by-step wizard)                 ██
+    // ════════════════════════════════════════════════════════════════
     return (
         <div className="panel" style={{ animation: 'fadeUp 0.6s cubic-bezier(0.22,1,0.36,1) forwards' }}>
-            {!voiceSupported && (
-                <div style={{
-                    fontSize: '0.7rem',
-                    color: 'var(--muted)',
-                    textAlign: 'center',
-                    marginBottom: '1rem',
-                    letterSpacing: '0.06em',
-                }}>
-                    Voice input unavailable in this browser — use the inputs below.
-                </div>
-            )}
 
             {/* Progress bar */}
             <div style={{

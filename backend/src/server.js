@@ -4,6 +4,7 @@ import multipart from '@fastify/multipart'
 import triageRoutes from './routes/triage.js'
 import ticketRoutes from './routes/ticket.js'
 import transcribeRoutes from './routes/transcribe.js'
+import ttsRoutes from './routes/tts.js'
 
 const server = Fastify({ logger: { level: 'warn' } })
 
@@ -18,6 +19,7 @@ await server.register(multipart, {
 await server.register(triageRoutes)
 await server.register(ticketRoutes)
 await server.register(transcribeRoutes)
+await server.register(ttsRoutes)
 
 server.setErrorHandler((error, req, reply) => {
     server.log.error({ err: error.message })
